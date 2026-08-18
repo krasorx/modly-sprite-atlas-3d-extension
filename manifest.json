@@ -4,7 +4,7 @@
   "type": "model",
   "source": "https://github.com/krasorx/modly-sprite-atlas-3d-extension",
   "description": "Loads a sprite atlas (multiple frames/angles of the same character) as input and reconstructs a 3D mesh that takes into account every view angle in the sheet.",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "author": "krasorx",
   "generator_class": "SpriteAtlas3DGenerator",
   "tags": ["image-to-3d", "multi-view", "sprite-atlas"],

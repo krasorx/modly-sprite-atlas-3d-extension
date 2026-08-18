@@ -139,8 +139,21 @@ class VisualHullReconstructor(Reconstructor):
         if not views:
             raise RuntimeError("No foreground silhouettes could be extracted from the atlas.")
 
-        # -- 2) occupancy grid (visual hull) -------------------------------
-        occ = _visual_hull(views, res)
+        # -- 2) choose strategy + build occupancy ---------------------------
+        # Visual-hull needs a *consistent turntable* (same body rotating). A
+        # sprite sheet of animation frames has very different silhouettes per
+        # frame (idle/run/jump), where intersecting the cones yields an empty
+        # or garbage volume. Detect that case and fall back to inflating the
+        # most descriptive silhouette so we never fail or emit a blob.
+        mode = _pick_mode(views)
+
+        if mode == "inflate":
+            occ = _inflate_volume(views, res)
+        else:
+            occ = _visual_hull(views, res)
+            # safety net: an empty/tiny hull → inflate the largest view
+            if occ.sum() < res * res * res * 0.004:
+                occ = _inflate_volume(views, res)
 
         # -- 3) surface extraction (voxel-face quads) ----------------------
         vertices, triangles, colors = _surface_from_volume(occ, views, colorize)
@@ -169,6 +182,54 @@ def _foreground_rgb(frame: np.ndarray, mask: np.ndarray) -> np.ndarray:
     if fg.size == 0:
         return np.array([160, 160, 160], dtype=np.uint8)
     return fg.mean(axis=0).astype(np.uint8)
+
+
+def _pick_mode(views) -> str:
+    """Return 'hull' for a consistent turntable, 'inflate' for animation frames."""
+    import numpy as np
+    if len(views) < 4:
+        return "inflate"
+    widths = []
+    heights = []
+    for v in views:
+        ys, xs = np.where(v["mask"])
+        if xs.size == 0:
+            continue
+        widths.append(float(xs.max() - xs.min()) + 1.0)
+        heights.append(float(ys.max() - ys.min()) + 1.0)
+    cv = lambda a: (np.std(a) / np.mean(a)) if np.mean(a) > 0 else 1.0  # noqa: E731
+    # animation frames swing wildly in size/shape; turntables stay ~constant
+    if cv(widths) > 0.22 or cv(heights) > 0.22:
+        return "inflate"
+    return "hull"
+
+
+def _inflate_volume(views, res: int) -> np.ndarray:
+    """Build a solid from the best (most pixel-dense) silhouette via an
+    ellipsoidal depth profile centred on the sprite's horizontal axis.
+    occ[y, x, z]; world x in [-1, 1], y up."""
+    import numpy as np
+    best = max(views, key=lambda v: int(v["mask"].sum()))
+    mask = best["mask"]
+    h = mask.shape[0]
+    axis = np.linspace(-1.0, 1.0, res)
+
+    occ = np.zeros((res, res, res), dtype=bool)
+    for iy, wy in enumerate(axis):
+        v_px = int(best["cy"] - wy * best["px_per_world"])
+        if not (0 <= v_px < h):
+            continue
+        for ix, wx in enumerate(axis):
+            u_px = int(best["cx"] + wx * best["px_per_world"])
+            if not (0 <= u_px < mask.shape[1]) or not mask[v_px, u_px]:
+                continue
+            # ellipsoid cross-section: thick where the sprite is wide/central,
+            # thin at the horizontal edges (a believable standing-character form)
+            depth = 0.55 * math.sqrt(max(0.0, 1.0 - wx * wx))
+            for iz, wz in enumerate(axis):
+                if -depth <= wz <= depth:
+                    occ[iy, ix, iz] = True
+    return occ
 
 
 def _visual_hull(views, res: int) -> np.ndarray:
