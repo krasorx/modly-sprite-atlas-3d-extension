@@ -96,12 +96,12 @@ class PlaceholderReconstructor(Reconstructor):
         import numpy as np
         import trimesh
 
-        # Build a simple rounded box as the placeholder mesh. Mesh density scales
-        # with the atlas so higher-resolution sheets produce more detail.
+        # Build a simple box as the placeholder mesh. Kept dependency-free of
+        # version-specific trimesh helpers (subdivide/subdivide_loop differ
+        # across trimesh releases).
         n_cells = max(1, len(frames))
         side = 0.8 if n_cells <= 16 else 0.9
         mesh = trimesh.creation.box(extents=[side, side, side])
-        mesh = trimesh.remesh.subdivide_loop(mesh, iterations=2)
         mesh.export(str(out_path))
         return out_path
 
