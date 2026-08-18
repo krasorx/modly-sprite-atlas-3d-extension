@@ -76,34 +76,221 @@ class Reconstructor:
     def load(self) -> None:
         raise NotImplementedError
 
-    def reconstruct(self, frames: list, angles: list[float], out_path: Path) -> Path:
+    def reconstruct(self, frames: list, angles: list[float], out_path: Path, params: dict) -> Path:
         raise NotImplementedError
 
 
-class PlaceholderReconstructor(Reconstructor):
-    """Produces a real (primitive) GLB mesh so the run completes.
+# ---------------------------------------------------------------------------
+# Visual-hull (shape-from-silhouette) reconstruction
+#
+# This is a real volumetric fusion that takes EVERY atlas view into account:
+#   1. Each frame is reduced to a binary silhouette (foreground mask).
+#   2. Every voxel in a 3D grid is projected to each view (the character is
+#      treated as a turntable: camera keeps fixed height, object rotates by
+#      the azimuth angle recovered from the atlas grid).
+#   3. A voxel is part of the model iff it projects inside the silhouette of
+#      ALL views (visual hull = intersection of the silhouette cones).
+#   4. Occupied-voxel faces are extracted into a closed mesh and per-vertex
+#      color is baked by averaging the visible foreground color over views.
+#
+# All dependencies (numpy, cv2, trimesh) are already in the extension venv.
+# ---------------------------------------------------------------------------
 
-    The silhouette of the first frame is the same for every view in the
-    placeholder. Swap this class for a real multi-view reconstruction model
-    (e.g. InstantMesh, or any NeuS/SDF fuser) to get an accurate mesh that
-    honours every angle in the atlas.
-    """
+class VisualHullReconstructor(Reconstructor):
+    """Full-angle volumetric reconstruction from sprite silhouettes."""
 
     def load(self) -> None:
         pass
 
-    def reconstruct(self, frames: list, angles: list[float], out_path: Path) -> Path:
+    def reconstruct(self, frames, angles, out_path: Path, params: dict):
+        import cv2
         import numpy as np
         import trimesh
 
-        # Build a simple box as the placeholder mesh. Kept dependency-free of
-        # version-specific trimesh helpers (subdivide/subdivide_loop differ
-        # across trimesh releases).
-        n_cells = max(1, len(frames))
-        side = 0.8 if n_cells <= 16 else 0.9
-        mesh = trimesh.creation.box(extents=[side, side, side])
+        bg = params.get("background", "alpha")
+        res = int(params.get("resolution", 96))
+        colorize = bool(params.get("colorize", True))
+
+        # -- 1) silhouettes ------------------------------------------------
+        views = []               # dicts: mask, cx, cy, px_per_world, rgb
+        for i, frame in enumerate(frames):
+            mask = _extract_silhouette(frame, bg)
+            # dilate a touch to bridge thin sprite edges
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+            mask = cv2.dilate(mask.astype(np.uint8), kernel, iterations=1) > 0
+            ys, xs = np.where(mask)
+            if xs.size == 0:
+                continue
+            cx = float(xs.mean())
+            cy = float(ys.mean())
+            bw = int(xs.max() - xs.min()) + 1
+            bh = int(ys.max() - ys.min()) + 1
+            px_per_world = max(bw, bh) / 2.0
+            theta = float(angles[i % len(angles)]) * np.pi / 180.0
+            views.append({
+                "mask": mask,
+                "cx": cx,
+                "cy": cy,
+                "px_per_world": px_per_world,
+                "sin": np.sin(theta),
+                "cos": np.cos(theta),
+                "rgb": _foreground_rgb(frame, mask),
+            })
+        if not views:
+            raise RuntimeError("No foreground silhouettes could be extracted from the atlas.")
+
+        # -- 2) occupancy grid (visual hull) -------------------------------
+        occ = _visual_hull(views, res)
+
+        # -- 3) surface extraction (voxel-face quads) ----------------------
+        vertices, triangles, colors = _surface_from_volume(occ, views, colorize)
+
+        # -- 4) export -----------------------------------------------------
+        mesh = trimesh.Trimesh(vertices=vertices, faces=triangles, vertex_colors=colors)
         mesh.export(str(out_path))
         return out_path
+
+
+def _extract_silhouette(frame: np.ndarray, bg: str) -> np.ndarray:
+    """frame: (H, W, 4) RGBA uint8 → bool mask of the foreground shape."""
+    import numpy as np
+    alpha = frame[..., 3]
+    if bg == "alpha":
+        return alpha > 128
+    rgb = frame[..., :3].astype(np.int16)
+    bg_rgb = 255 if bg == "white" else 0
+    diff = np.abs(rgb - bg_rgb).sum(axis=2)
+    return (diff > 40) & (alpha > 128)
+
+
+def _foreground_rgb(frame: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    import numpy as np
+    fg = frame[..., :3][mask]
+    if fg.size == 0:
+        return np.array([160, 160, 160], dtype=np.uint8)
+    return fg.mean(axis=0).astype(np.uint8)
+
+
+def _visual_hull(views, res: int) -> np.ndarray:
+    """bool (res, res, res): voxel occupied iff its projection into EVERY view
+    falls inside that view's silhouette.
+
+    occ[y, x, z] ↔ world coords (x, y, z) with y up.
+    """
+    import numpy as np
+    axis = np.linspace(-1.0, 1.0, res)
+    grid_x = axis[None, :, None]      # (1, N, 1) → index 1
+    grid_y = axis[:, None, None]      # (N, 1, 1) → index 0
+    grid_z = axis[None, None, :]      # (1, 1, N) → index 2
+
+    occ = np.ones((res, res, res), dtype=bool)
+    for v in views:
+        mask = v["mask"]
+        h, w = mask.shape
+        # camera looks horizontally at a turntable (object rotated about Y):
+        # u = x·cosθ + z·sinθ, v = y (Y up)
+        u = np.broadcast_to(grid_x * v["cos"] + grid_z * v["sin"], occ.shape)
+        vv = np.broadcast_to(grid_y, occ.shape)
+        u_px = v["cx"] + u * v["px_per_world"]
+        v_px = v["cy"] - vv * v["px_per_world"]  # image Y grows downward
+        ui = np.floor(u_px).astype(int)
+        vi = np.floor(v_px).astype(int)
+        inside = (ui >= 0) & (ui < w) & (vi >= 0) & (vi < h)
+        # out-of-frame voxels are NOT in this silhouette cone
+        hit = np.zeros(occ.shape, dtype=bool)
+        hit[inside] = mask[vi[inside], ui[inside]]
+        occ &= hit
+    return occ
+
+
+def _surface_from_volume(occ: np.ndarray, views, colorize: bool):
+    """Emit a quad (2 triangles) per occupied-voxel face adjacent to empty space."""
+    import numpy as np
+    n = occ.shape[0]
+    # pad so grid edges have an "empty" layer
+    padded = np.zeros((n + 2, n + 2, n + 2), dtype=bool)
+    padded[1:-1, 1:-1, 1:-1] = occ
+    occ_indices = np.argwhere(occ)
+
+    half = 1.0 / n  # voxel world size in [-1,1] grid
+
+    verts: list[np.ndarray] = []
+    faces: list[list[int]] = []
+    cols: list[list[int]] = []
+    for (iy, ix, iz) in occ_indices:
+        for (dx, dy, dz) in [(-1,0,0),(1,0,0),(0,-1,0),(0,1,0),(0,0,-1),(0,0,1)]:
+            nx, ny, nz = ix + dx, iy + dy, iz + dz
+            if padded[nx + 1, ny + 1, nz + 1]:
+                continue  # neighbor occupied → internal face
+            wx = -1.0 + (2.0 / n) * (0.5 + ix)
+            wy = -1.0 + (2.0 / n) * (0.5 + iy)
+            wz = -1.0 + (2.0 / n) * (0.5 + iz)
+            base = np.array([wx, wy, wz])
+            corners = _face_corners(dx, dy, dz, base, half)
+            face_col = _face_color(ix, iy, iz, views, n, colorize) if colorize else None
+            start = len(verts)
+            for corner in corners:
+                verts.append(corner)
+                cols.append(face_col if face_col is not None else [255, 255, 255])
+            faces.append([start, start + 1, start + 2])
+            faces.append([start, start + 2, start + 3])
+    if not verts:
+        raise RuntimeError("Empty occupancy volume — cannot build a mesh.")
+
+    vertices = np.array(verts, dtype=np.float32)
+    triangles = np.array(faces, dtype=np.int64)
+    colors = np.array(cols, dtype=np.uint8)
+    if colors.ndim == 2 and colors.shape[1] == 3:
+        colors = np.hstack([colors, np.full((len(colors), 1), 255, np.uint8)])
+    else:
+        colors = np.full((len(vertices), 4), 255, dtype=np.uint8)
+    return vertices, triangles, colors
+
+
+def _face_corners(dx, dy, dz, base, half):
+    """4 corners of the face normal to (dx,dy,dz), CCW when seen from outside."""
+    import numpy as np
+    # tangents t1, t2 with cross(t1, t2) == (dx, dy, dz)
+    if dx != 0:
+        t1 = np.array([0.0, 1.0, 0.0])
+        t2 = np.array([0.0, 0.0, float(dx)])
+    elif dy != 0:
+        t1 = np.array([1.0, 0.0, 0.0])
+        t2 = np.array([0.0, 0.0, float(-dy)])
+    else:
+        t1 = np.array([1.0, 0.0, 0.0])
+        t2 = np.array([0.0, float(dz), 0.0])
+    s = half
+    c00 = base - s * t1 - s * t2
+    c01 = base + s * t1 - s * t2
+    c11 = base + s * t1 + s * t2
+    c10 = base - s * t1 + s * t2
+    return [c00, c01, c11, c10]
+
+
+def _face_color(ix, iy, iz, views, n, colorize):
+    """Average foreground color of the voxel over the views that see it."""
+    import numpy as np
+    if not colorize:
+        return None
+    x = -1.0 + (2.0 / n) * (0.5 + ix)
+    y = -1.0 + (2.0 / n) * (0.5 + iy)
+    z = -1.0 + (2.0 / n) * (0.5 + iz)
+    accumulate = np.zeros(3, dtype=np.float64)
+    count = 0.0
+    for v in views:
+        mask = v["mask"]
+        hh, ww = mask.shape
+        u = x * v["cos"] + z * v["sin"]
+        u_px = v["cx"] + u * v["px_per_world"]
+        v_px = v["cy"] - y * v["px_per_world"]
+        ui, vi = int(np.floor(u_px)), int(np.floor(v_px))
+        if 0 <= ui < ww and 0 <= vi < hh and mask[vi, ui]:
+            accumulate += v["rgb"].astype(np.float64)
+            count += 1.0
+    if count == 0:
+        return None
+    return (accumulate / count).astype(np.uint8)
 
 
 # ---------------------------------------------------------------------------
@@ -166,7 +353,7 @@ class SpriteAtlas3DGenerator(BaseGenerator):
         self.outputs_dir.mkdir(parents=True, exist_ok=True)
         out_path = self.outputs_dir / f"{int(time.time())}_{uuid.uuid4().hex[:8]}.glb"
 
-        self._backbone.reconstruct([np.asarray(f) for f in frames], angles, out_path)
+        self._backbone.reconstruct([np.asarray(f) for f in frames], angles, out_path, params)
         self._check_cancelled(cancel_event)
 
         self._report(progress_cb, 100, "Done")
@@ -176,8 +363,7 @@ class SpriteAtlas3DGenerator(BaseGenerator):
 
     @staticmethod
     def _make_reconstructor() -> Reconstructor:
-        # Swap this for SDFMultiViewReconstructor once a real model is wired in.
-        return PlaceholderReconstructor()
+        return VisualHullReconstructor()
 
     def _report(self, cb, pct, msg):
         if cb:

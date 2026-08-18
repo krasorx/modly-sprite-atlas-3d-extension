@@ -18,8 +18,15 @@ lives inside `generator.py`:
    each frame based on your grid layout (`row-major` or `column-major`).
 3. **Normalize** — each frame is resized to a square canvas with the selected
    background (transparent/white/black).
-4. **Reconstruct** — every posed frame is fed to a multi-view reconstruction
-   backend and fused into a single mesh.
+4. **Reconstruct** — a **visual-hull (shape-from-silhouette)** volumetric fusion
+   reconstructs the model from every posed frame:
+   - each frame is reduced to a binary foreground silhouette,
+   - every voxel of a 3D grid is projected to each view (the character is
+     treated as a turntable rotated about the recovered azimuth angle),
+   - a voxel is part of the model iff it projects inside the silhouette of
+     **all** views (intersection of the silhouette cones),
+   - occupied-voxel faces are extracted into a closed mesh and **per-vertex
+     colour** is baked by averaging the visible foreground colour over views.
 
 ## Files
 
@@ -45,19 +52,18 @@ lives inside `generator.py`:
 | `background` | select | `alpha` | Frame background handling |
 | `view_order` | select | `row-major` | How frames map to azimuth angles |
 | `sample_size` | int | 512 | Per-frame resolution sent to the model |
+| `resolution` | select | 96 | Voxel grid resolution (64/96/128) of the reconstruction |
+| `colorize` | select | on | Bake per-vertex colour from the atlas frames |
 | `seed` | int | -1 | Reproducibility; -1 = random |
 
-## Putting real reconstruction behind it
+## Reconstruction backend
 
-`generator.py` ships with a **placeholder** `SDFMultiViewReconstructor`. To get
-a real mesh, wire in your multi-view backbone. Recommended model families:
+By default the extension uses `VisualHullReconstructor`, a self-contained,
+CPU-only volumetric fusion (numpy + opencv + trimesh) that uses **every**
+atlas angle. It is deterministic and needs no model weights to download.
 
-- InstantMesh (multi-view gen + NeuS fusion)
-- Any model exposing camera pose + NeuS/SDF fusion from multiple views
-- A per-angle reconstruction loop fused with an offscreen baker
-
-Two integration shapes are documented in `SDFMultiViewReconstructor.reconstruct()`:
-single-image-backbone looping per angle, or a batched multi-view call.
+To push quality further, swap it for a neural SDF / NeuS fuser (e.g.
+InstantMesh) by replacing `_make_reconstructor()` in `generator.py`.
 
 ## License
 
