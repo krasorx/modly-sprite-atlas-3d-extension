@@ -1,0 +1,78 @@
+{
+  "id": "sprite-atlas-3d",
+  "name": "Sprite Atlas to 3D",
+  "type": "model",
+  "source": "https://github.com/krasorx/modly-sprite-atlas-3d-extension",
+  "description": "Loads a sprite atlas (multiple frames/angles of the same character) as input and reconstructs a 3D mesh that takes into account every view angle in the sheet.",
+  "version": "0.1.0",
+  "author": "krasorx",
+  "generator_class": "SpriteAtlas3DGenerator",
+  "tags": ["image-to-3d", "multi-view", "sprite-atlas"],
+  "nodes": [
+    {
+      "id": "generate",
+      "name": "Generate Mesh from Atlas",
+      "input": "image",
+      "output": "mesh",
+      "params_schema": [
+        {
+          "id": "cols",
+          "label": "Columns",
+          "type": "int",
+          "default": 4,
+          "min": 1,
+          "tooltip": "Number of columns in the sprite atlas grid."
+        },
+        {
+          "id": "rows",
+          "label": "Rows",
+          "type": "int",
+          "default": 4,
+          "min": 1,
+          "tooltip": "Number of rows in the sprite atlas grid."
+        },
+        {
+          "id": "background",
+          "label": "Background Color",
+          "type": "select",
+          "default": "alpha",
+          "options": [
+            { "value": "alpha", "label": "Transparent (alpha)" },
+            { "value": "white", "label": "White" },
+            { "value": "black", "label": "Black" }
+          ],
+          "tooltip": "How to treat the background of each frame before reconstruction."
+        },
+        {
+          "id": "view_order",
+          "label": "View Order",
+          "type": "select",
+          "default": "row-major",
+          "options": [
+            { "value": "row-major", "label": "Row-major" },
+            { "value": "column-major", "label": "Column-major" }
+          ],
+          "tooltip": "Order in which frames are assigned an azimuth angle."
+        },
+        {
+          "id": "sample_size",
+          "label": "Sample Size",
+          "type": "int",
+          "default": 512,
+          "min": 128,
+          "max": 1024,
+          "tooltip": "Pixel size each frame is normalized to before reconstruction."
+        },
+        {
+          "id": "seed",
+          "label": "Seed",
+          "type": "int",
+          "default": -1,
+          "min": -1,
+          "max": 4294967295,
+          "tooltip": "Seed for reproducibility. -1 = random."
+        }
+      ]
+    }
+  ]
+}
