@@ -101,7 +101,7 @@ class PlaceholderReconstructor(Reconstructor):
         n_cells = max(1, len(frames))
         side = 0.8 if n_cells <= 16 else 0.9
         mesh = trimesh.creation.box(extents=[side, side, side])
-        mesh = mesh.subdivide(levels=2)
+        mesh = trimesh.remesh.subdivide_loop(mesh, iterations=2)
         mesh.export(str(out_path))
         return out_path
 
