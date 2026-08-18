@@ -22,10 +22,6 @@ from __future__ import annotations
 
 import math
 import os
-from io import BytesIO
-
-import numpy as np
-from PIL import Image
 
 from api.services.generators.base import BaseGenerator
 
@@ -34,7 +30,7 @@ from api.services.generators.base import BaseGenerator
 # 1) Atlas slicing
 # ---------------------------------------------------------------------------
 
-def slice_atlas(image: Image.Image, cols: int, rows: int) -> list[Image.Image]:
+def slice_atlas(image, cols: int, rows: int) -> list:
     """Cut a sprite sheet into its grid frames, left-to-right, top-to-bottom.
 
     Padding is included per-cell so frame borders don't bleed into each other.
@@ -43,7 +39,7 @@ def slice_atlas(image: Image.Image, cols: int, rows: int) -> list[Image.Image]:
     cell_w = max(1, w // cols)
     cell_h = max(1, h // rows)
     pad = 2
-    frames: list[Image.Image] = []
+    frames = []
     for r in range(rows):
         for c in range(cols):
             left = c * cell_w
@@ -67,8 +63,10 @@ def recover_view_angles(count: int, order: str) -> list[float]:
     return angles
 
 
-def normalize_frame(frame: Image.Image, size: int, background: str) -> Image.Image:
+def normalize_frame(frame, size: int, background: str):
     """Resize a frame to a square canvas and set the background."""
+    from PIL import Image
+
     bg = background if background != "alpha" else "rgba(0,0,0,0)"
     canvas = Image.new("RGBA", (size, size), bg)
     frame = frame.convert("RGBA")
@@ -161,6 +159,11 @@ class SpriteAtlas3DGenerator(BaseGenerator):
     # -- Public pipeline --------------------------------------------------------
 
     def generate(self, image_bytes: bytes, params: dict) -> str:
+        from io import BytesIO
+
+        import numpy as np
+        from PIL import Image
+
         cols = int(params.get("cols", 4))
         rows = int(params.get("rows", 4))
         bg = params.get("background", "alpha")

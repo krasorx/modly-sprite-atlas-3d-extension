@@ -1,63 +1,77 @@
-"""Shared build metadata to keep dependency versions consistent."""
-import os
+"""
+Sprite Atlas to 3D — extension setup script.
+
+Creates an isolated venv and installs all required dependencies.
+Called by Modly at extension install time with:
+
+    python setup.py <json_args>
+
+where json_args contains:
+    python_exe   — path to Modly's embedded Python (used to create the venv)
+    ext_dir      — absolute path to this extension directory
+    gpu_sm       — GPU compute capability as integer (e.g. 86 for Ampere; 0 on macOS)
+    cuda_version — CUDA major/minor encoded as integer (e.g. 124, 128)
+    torch_flavor — Flavor of torch (cuda, rocm - defaults to cuda)
+    accelerator  — "mps" | "cuda" | "cpu"  (passed by Electron since Modly 1.x)
+    platform     — Electron's process.platform string ("win32", "darwin", "linux")
+"""
+import json
+import platform
+import subprocess
+import sys
 from pathlib import Path
 
-MODLY_EXT_ID = "sprite-atlas-3d"
 
-TORCH_INDEX = "https://download.pytorch.org/whl/cu121"
-
-
-def pinned_requirements(platform_python: dict | None = None) -> list[str]:
-    """Return the base dependency list for the extension venv.
-
-    Extend this set with the packages required by your chosen
-    multi-view reconstruction backbone (torch, numpy, PIL, trimesh, etc.).
-    """
-    return [
-        "numpy",
-        "pillow",
-        "trimesh",
-        "torch",         # resize/tense helpers
-        "torchvision",
-    ]
+# Base packages needed to load and run the atlas -> mesh pipeline.
+# Extend this list when a concrete multi-view reconstruction backbone is wired in.
+CORE_DEPS = [
+    "Pillow>=10.0.0",   # atlas slicing / frame normalization (the currently missing dep)
+    "numpy",
+    "trimesh",          # mesh IO / export (.glb, .obj)
+    "opencv-python-headless",
+    "huggingface_hub",  # model weight downloads
+]
 
 
-def extra_index_urls() -> list[str]:
-    """PyTorch wheel index; helps pip resolve CUDA wheels on Linux/Windows."""
-    urls = [TORCH_INDEX]
-    if os.getenv("MODLY_CUDA_VERSION", "").startswith("12."):
-        urls.append("https://download.pytorch.org/whl/cu128")
-    return urls
+def pip(venv: Path, *args: str) -> None:
+    is_win = platform.system() == "Windows"
+    pip_exe = venv / ("Scripts/pip.exe" if is_win else "bin/pip")
+    subprocess.run([str(pip_exe), *args], check=True)
 
 
-def resolved_pyproject() -> str:
-    requires = pinned_requirements()
-    index_marker = "\n".join(
-        "      --extra-index-url " + u for u in extra_index_urls()
-    )
-    return f"""\
-[build-system]
-requires = ["setuptools>=68"]
-build-backend = "setuptools.build_meta"
+def setup(
+    python_exe:    str,
+    ext_dir:       Path,
+    gpu_sm:        int = 0,
+    cuda_version:  int = 0,
+    torch_flavor:  str = "cuda",
+    accelerator:   str = "",
+    platform_name: str = "",
+) -> None:
+    venv = ext_dir / "venv"
 
-[project]
-name = "modly-{MODLY_EXT_ID}"
-version = "0.1.0"
-description = "Modly extension: sprite atlas -> 3D mesh with multi-view reconstruction."
-requires-python = ">=3.10"
-dependencies = {requires!r}
+    print(f"[setup] Creating venv at {venv} …")
+    subprocess.run([python_exe, "-m", "venv", str(venv)], check=True)
 
-[tool.pip]
-{index_marker}
-"""
+    print("[setup] Installing core dependencies …")
+    pip(venv, "install", *CORE_DEPS)
 
-
-def write_pyproject(path: Path) -> Path:
-    target = path / "pyproject.toml"
-    target.write_text(resolved_pyproject())
-    return target
+    print("[setup] Done. Venv ready at:", venv)
 
 
 if __name__ == "__main__":
-    out = Path(os.getenv("MODLY_INSTALL_DIR", "."))
-    print(f"Written: {write_pyproject(out)}")
+    if len(sys.argv) == 2:
+        args = json.loads(sys.argv[1])
+        setup(
+            python_exe    = args["python_exe"],
+            ext_dir       = Path(args["ext_dir"]),
+            gpu_sm        = int(args.get("gpu_sm", 0)),
+            cuda_version  = int(args.get("cuda_version", 0)),
+            torch_flavor  = args.get("torch_flavor", "cuda"),
+            accelerator   = args.get("accelerator", ""),
+            platform_name = args.get("platform", ""),
+        )
+    else:
+        print("Usage: python setup.py <json_args>")
+        print('  e.g. python setup.py \'{"python_exe":"...","ext_dir":"...","gpu_sm":86}\'')
+        sys.exit(1)
