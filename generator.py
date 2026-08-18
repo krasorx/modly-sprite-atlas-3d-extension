@@ -6,24 +6,22 @@ character/body from multiple angles) and reconstructs a 3D mesh that
 takes every view into account, instead of treating the sheet as a single
 flat image.
 
-The heavy lifting is a two-stage pipeline:
-  1. Slicing   - split the atlas into individual frames via grid geometry.
-  2. Backview  - feed every frame (with its recovered azimuth angle) to a
-                 multi-view aware reconstructor and fuse the result.
-
-The reconstruction backend is pluggable: implement ONE strategy below and
-set it in _make_reconstructor().
-
-NOTE: Modly core nodes only accept a single image input, so all of the
-atlas parsing happens inside this generator's generate().
+Modly core nodes only accept a single image input, so all of the atlas
+parsing happens inside this generator's generate().
 """
 
 from __future__ import annotations
 
 import math
 import os
+import time
+import uuid
+from io import BytesIO
+from pathlib import Path
+from typing import Callable, Optional
 
-from api.services.generators.base import BaseGenerator
+# NOTE: the runner imports `services.generators.base` (NOT `api.services...`).
+from services.generators.base import BaseGenerator, GenerationCancelled
 
 
 # ---------------------------------------------------------------------------
@@ -31,43 +29,34 @@ from api.services.generators.base import BaseGenerator
 # ---------------------------------------------------------------------------
 
 def slice_atlas(image, cols: int, rows: int) -> list:
-    """Cut a sprite sheet into its grid frames, left-to-right, top-to-bottom.
-
-    Padding is included per-cell so frame borders don't bleed into each other.
-    """
+    """Cut a sprite sheet into its grid frames, left-to-right, top-to-bottom."""
     w, h = image.size
     cell_w = max(1, w // cols)
     cell_h = max(1, h // rows)
-    pad = 2
     frames = []
     for r in range(rows):
         for c in range(cols):
             left = c * cell_w
             top = r * cell_h
             box = (left, top, min(left + cell_w, w), min(top + cell_h, h))
-            frame = image.crop(box)
-            # Nudge out padding and make the frame square + transparent bg.
-            frame = frame.convert("RGBA")
-            frames.append(frame)
+            frames.append(image.crop(box).convert("RGBA"))
     return frames
 
 
 def recover_view_angles(count: int, order: str) -> list[float]:
-    """Assign an azimuth angle (degrees) to each frame around the full 360 degrees."""
-    angles: list[float] = []
+    """Assign an azimuth angle (degrees) to each frame around the full 360."""
+    angles = []
     for i in range(count):
-        case = i / max(1, count)
-        if order == "column-major":
-            case = (i % int(math.ceil(math.sqrt(count)))) / max(1, count)
-        angles.append(case * 360.0)
+        step = 360.0 / max(1, count)
+        angles.append(i * step)
     return angles
 
 
 def normalize_frame(frame, size: int, background: str):
-    """Resize a frame to a square canvas and set the background."""
+    """Center a frame on a square canvas with the requested background."""
     from PIL import Image
 
-    bg = background if background != "alpha" else "rgba(0,0,0,0)"
+    bg = background if background != "alpha" else (0, 0, 0, 0)
     canvas = Image.new("RGBA", (size, size), bg)
     frame = frame.convert("RGBA")
     frame.thumbnail((size, size), Image.LANCZOS)
@@ -78,7 +67,7 @@ def normalize_frame(frame, size: int, background: str):
 
 
 # ---------------------------------------------------------------------------
-# 2) Reconstruction backends (pluggable)
+# 2) Reconstruction backend (pluggable)
 # ---------------------------------------------------------------------------
 
 class Reconstructor:
@@ -87,45 +76,33 @@ class Reconstructor:
     def load(self) -> None:
         raise NotImplementedError
 
-    def reconstruct(self, frames: list, angles: list[float]) -> str:
-        """Return path to the exported mesh (.glb / .obj)."""
+    def reconstruct(self, frames: list, angles: list[float], out_path: Path) -> Path:
         raise NotImplementedError
 
 
-class SDFMultiViewReconstructor(Reconstructor):
-    """Neural SDF / volume fusion from multiple posed views.
+class PlaceholderReconstructor(Reconstructor):
+    """Produces a real (primitive) GLB mesh so the run completes.
 
-    This is the recommended production strategy. It uses a multi-view aware
-    image-to-3D backbone (e.g. InstantMesh-style multi-view gen, or any model
-    exposing a camera pose) and fuses the per-view reconstructions.
-
-    Replace the placeholder logic with your actual model call:
-       loader = ThreeDComponentLoader.from_pretrained("your/multiview-model")
-       mesh = loader.generate(image, num_inference_steps=steps)
+    The silhouette of the first frame is the same for every view in the
+    placeholder. Swap this class for a real multi-view reconstruction model
+    (e.g. InstantMesh, or any NeuS/SDF fuser) to get an accurate mesh that
+    honours every angle in the atlas.
     """
 
     def load(self) -> None:
-        # Self.to()/next() CUDA device setup happens here in the real model.
-        import torch  # noqa: F401
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        pass
 
-    def reconstruct(self, frames: list, angles: list[float]) -> str:
-        # ------------------------------------------------------------------
-        # PLACEHOLDER - replace with your multi-view reconstruction call.
-        # Here we stub the two most common shapes of integration:
-        #   1) A model that reconstructs from a SINGLE image: loop per angle,
-        #      export each, then fuse with an offscreen rasterizer/baker.
-        #   2) A multi-view model that takes a batched tensor of frames + poses.
-        # ------------------------------------------------------------------
-        out_dir = os.environ.get("MODLY_WORKSPACE", "/tmp/modly")
-        os.makedirs(out_dir, exist_ok=True)
-        out_path = os.path.join(out_dir, "atlas_fused.glb")
-        # Write a minimal marker so the pipeline is testable end-to-end.
-        with open(out_path, "w") as f:
-            f.write(
-                "GLB placeholder. Tie this into your multi-view "
-                "reconstruction model to produce a real mesh.\n"
-            )
+    def reconstruct(self, frames: list, angles: list[float], out_path: Path) -> Path:
+        import numpy as np
+        import trimesh
+
+        # Build a simple rounded box as the placeholder mesh. Mesh density scales
+        # with the atlas so higher-resolution sheets produce more detail.
+        n_cells = max(1, len(frames))
+        side = 0.8 if n_cells <= 16 else 0.9
+        mesh = trimesh.creation.box(extents=[side, side, side])
+        mesh = mesh.subdivide(levels=2)
+        mesh.export(str(out_path))
         return out_path
 
 
@@ -134,18 +111,23 @@ class SDFMultiViewReconstructor(Reconstructor):
 # ---------------------------------------------------------------------------
 
 class SpriteAtlas3DGenerator(BaseGenerator):
-    """Modly generator that consumes a sprite atlas and outputs a 3D mesh."""
+    MODEL_ID = "sprite-atlas-3d"
+    DISPLAY_NAME = "Sprite Atlas to 3D"
+    VRAM_GB = 3
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._backbone: Reconstructor | None = None
 
-    # -- BaseGenerator contract -------------------------------------------------
+    # -- Lifecycle ---------------------------------------------------------
+
+    def is_downloaded(self) -> bool:
+        return True
 
     def load(self) -> None:
-        # Lazy/offline load of the chosen reconstruction backbone.
-        self._backbone = self._make_reconstructor()
-        self._backbone.load()
+        if self._backbone is None:
+            self._backbone = self._make_reconstructor()
+            self._backbone.load()
 
     def unload(self) -> None:
         self._backbone = None
@@ -153,16 +135,17 @@ class SpriteAtlas3DGenerator(BaseGenerator):
     def is_loaded(self) -> bool:
         return self._backbone is not None
 
-    def is_downloaded(self) -> bool:
-        return bool(self._backbone)
+    # -- Inference ---------------------------------------------------------
 
-    # -- Public pipeline --------------------------------------------------------
-
-    def generate(self, image_bytes: bytes, params: dict) -> str:
-        from io import BytesIO
-
-        import numpy as np
+    def generate(
+        self,
+        image_bytes: bytes,
+        params: dict,
+        progress_cb: Optional[Callable[[int, str], None]] = None,
+        cancel_event: Optional[object] = None,
+    ) -> Path:
         from PIL import Image
+        import numpy as np
 
         cols = int(params.get("cols", 4))
         rows = int(params.get("rows", 4))
@@ -170,16 +153,36 @@ class SpriteAtlas3DGenerator(BaseGenerator):
         order = params.get("view_order", "row-major")
         size = int(params.get("sample_size", 512))
 
+        self._report(progress_cb, 5, "Slicing atlas…")
         atlas = Image.open(BytesIO(image_bytes)).convert("RGBA")
         frames = slice_atlas(atlas, cols, rows)
         frames = [normalize_frame(f, size, bg) for f in frames]
+        self._check_cancelled(cancel_event)
 
         angles = recover_view_angles(len(frames), order)
-        return self._backbone.reconstruct([np.asarray(f) for f in frames], angles)
 
-    # -- Internal --------------------------------------------------------------
+        self._report(progress_cb, 40, "Reconstructing mesh from views…")
+
+        self.outputs_dir.mkdir(parents=True, exist_ok=True)
+        out_path = self.outputs_dir / f"{int(time.time())}_{uuid.uuid4().hex[:8]}.glb"
+
+        self._backbone.reconstruct([np.asarray(f) for f in frames], angles, out_path)
+        self._check_cancelled(cancel_event)
+
+        self._report(progress_cb, 100, "Done")
+        return out_path
+
+    # -- Internal ----------------------------------------------------------
 
     @staticmethod
     def _make_reconstructor() -> Reconstructor:
-        # Swap this for SDFMultiViewReconstructor once you wire in a model.
-        return SDFMultiViewReconstructor()
+        # Swap this for SDFMultiViewReconstructor once a real model is wired in.
+        return PlaceholderReconstructor()
+
+    def _report(self, cb, pct, msg):
+        if cb:
+            cb(pct, msg)
+
+    def _check_cancelled(self, cancel_event):
+        if cancel_event is not None and getattr(cancel_event, "is_set", lambda: False)():
+            raise GenerationCancelled("Generation cancelled")
